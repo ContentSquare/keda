@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Shopify/sarama"
 	v2beta2 "k8s.io/api/autoscaling/v2beta2"
@@ -22,6 +25,78 @@ type kafkaScaler struct {
 	metadata kafkaMetadata
 	client   sarama.Client
 	admin    sarama.ClusterAdmin
+	tsdb     *metricsDB
+}
+
+type metricsDB struct {
+	ctx             context.Context
+	db              map[time.Time]int64
+	cleanupInterval time.Duration
+	timeWindow      time.Duration
+	timer           *time.Timer
+	mu              *sync.Mutex
+}
+
+func newMetricsDB(ctx context.Context, timeWindow time.Duration, scrapeInterval time.Duration) (*metricsDB, error) {
+	db := &metricsDB{
+		ctx:             ctx,
+		db:              make(map[time.Time]int64, 0),
+		cleanupInterval: timeWindow + scrapeInterval,
+		timeWindow:      timeWindow,
+		timer:           time.NewTimer(timeWindow + scrapeInterval),
+		mu:              &sync.Mutex{},
+	}
+
+	go db.runCleaner()
+	return db, nil
+}
+
+func (m *metricsDB) add(value int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	m.db[now] = value
+	return nil
+}
+
+func (m *metricsDB) cleanup() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before := time.Now().Add(-m.timeWindow)
+	for k, _ := range m.db {
+		if k.Before(before) {
+			delete(m.db, k)
+		}
+	}
+	return nil
+}
+
+func (m *metricsDB) getMetricForTimeWindow() (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	value := int64(0)
+	after := time.Now().Add(-m.timeWindow)
+	for k, v := range m.db {
+		if k.After(after) {
+			value += v
+		}
+	}
+	computedValue := float64(value) / m.timeWindow.Seconds()
+	return int64(math.Round(computedValue)), nil
+}
+
+func (m *metricsDB) runCleaner() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			kafkaLog.Info("Shutting down cleaner go routine")
+			return
+		case <-m.timer.C:
+			kafkaLog.Info("cleanup expired metrics")
+			m.cleanup()
+			m.timer.Reset(m.cleanupInterval)
+		}
+	}
 }
 
 type kafkaMetadata struct {
@@ -41,6 +116,9 @@ type kafkaMetadata struct {
 	cert      string
 	key       string
 	ca        string
+
+	// TimeWindow
+	timeWindow time.Duration
 }
 
 type offsetResetPolicy string
@@ -82,10 +160,16 @@ func NewKafkaScaler(config *ScalerConfig) (Scaler, error) {
 		return nil, err
 	}
 
+	var tsdb *metricsDB
+	if kafkaMetadata.timeWindow != time.Duration(0) {
+		tsdb, _ = newMetricsDB(context.Background(), kafkaMetadata.timeWindow, time.Second*30)
+	}
+
 	return &kafkaScaler{
 		client:   client,
 		admin:    admin,
 		metadata: kafkaMetadata,
+		tsdb:     tsdb,
 	}, nil
 }
 
@@ -157,6 +241,15 @@ func parseKafkaMetadata(config *ScalerConfig) (kafkaMetadata, error) {
 		} else {
 			return meta, fmt.Errorf("err SASL mode %s given", mode)
 		}
+	}
+
+	// Parse timeWindow is specified
+	if val, ok := config.TriggerMetadata["timeWindow"]; ok {
+		parsedSeconds, err := strconv.Atoi(val)
+		if err != nil {
+			return meta, fmt.Errorf("unable to parse %s to integer. err=%v", val, err.Error())
+		}
+		meta.timeWindow = time.Duration(parsedSeconds) * time.Second
 	}
 
 	meta.enableTLS = false
@@ -365,10 +458,21 @@ func (s *kafkaScaler) GetMetrics(ctx context.Context, metricName string, metricS
 		totalLag = int64(len(partitions)) * s.metadata.lagThreshold
 	}
 
+	// If a timeWindow is provided, let's return a value based on that timeWindow
+	var returnWindowSeconds *int64
+	if s.metadata.timeWindow != time.Duration(0) {
+		s.tsdb.add(totalLag)
+		// Compute totalLag base on TimeWindow
+		totalLag, _ = s.tsdb.getMetricForTimeWindow()
+		tmpReturnWindowSeconds := int64(math.Round(s.tsdb.timeWindow.Seconds()))
+		returnWindowSeconds = &tmpReturnWindowSeconds
+	}
+
 	metric := external_metrics.ExternalMetricValue{
-		MetricName: metricName,
-		Value:      *resource.NewQuantity(totalLag, resource.DecimalSI),
-		Timestamp:  metav1.Now(),
+		MetricName:    metricName,
+		Value:         *resource.NewQuantity(totalLag, resource.DecimalSI),
+		Timestamp:     metav1.Now(),
+		WindowSeconds: returnWindowSeconds,
 	}
 
 	return append([]external_metrics.ExternalMetricValue{}, metric), nil
